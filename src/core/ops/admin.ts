@@ -1,4 +1,7 @@
+import { PAGE_MUTATION_PARAMS } from '../persistence/params.ts';
 import { readPolicyOpts } from './context.ts';
+import { attributeVersions, canReadWriteAttribution } from './attribution.ts';
+import { GET_VERSIONS_DEFAULT_LIMIT, GET_VERSIONS_REMOTE_MAX_LIMIT, pagingLimit, reportVersionPage } from './read-paging.ts';
 import { sanitizeRemoteBody } from '../remote-body.ts';
 /**
  * Admin operation cluster — pure move from operations.ts (v0.46.x tranche 2).
@@ -13,6 +16,9 @@ import { sanitizeRemoteBody } from '../remote-body.ts';
 import type { Operation, OperationContext } from './contract.ts';
 import { enforceClientSlugFence, sourceScopeOpts } from './context.ts';
 import { VERSION } from '../../version.ts';
+import { resolveActiveEmbeddingColumnFromEngine } from '../search/embedding-column.ts';
+import { memoizedHealth } from '../health-memo.ts';
+import { LARGE_PAGES_CAPABILITY } from './get-page-body.ts';
 
 // --- Admin ---
 
@@ -30,6 +36,9 @@ function diagnosticScope(ctx: OperationContext): { sourceId?: string; sourceIds?
 
 const get_stats: Operation = {
   name: 'get_stats',
+  mutating: false,
+  idempotent: true,
+  outputRedaction: 'no_stored_text',
   description: 'Brain statistics (page count, chunk count, etc.) — remote callers see counters confined to their source grant.',
   params: {},
   handler: async (ctx) => {
@@ -41,14 +50,27 @@ const get_stats: Operation = {
 
 const get_health: Operation = {
   name: 'get_health',
-  description: 'Brain health dashboard (embed coverage, stale pages, orphans) — remote callers see counters confined to their source grant. Includes a `migrations {pending, partial, wedged, skipped_future}` block from the host migration ledger so remote agents can detect wedged/outstanding host migrations without shelling into the brain host.',
+  mutating: false,
+  idempotent: true,
+  outputRedaction: 'no_stored_text',
+  description: 'Brain health dashboard (embed coverage, stale pages, orphans) — remote callers see counters confined to their source grant. Includes a `migrations {pending, pending_fresh_install, partial, wedged, skipped_future}` block from the host migration ledger so remote agents can detect wedged/outstanding host migrations without shelling into the brain host (pending_fresh_install = setup a new brain has not run yet, not a broken upgrade). `computed_at` is when the counters were read: a repeat call within `health.cache_ttl_ms` (default 30000; env GBRAIN_HEALTH_CACHE_TTL_MS; 0 disables) with no page or config change returns the memoized numbers.',
   params: {},
   handler: async (ctx) => {
     // The `migrations` block below stays GLOBAL for scoped callers by
     // decision: it is a host filesystem ledger with no per-source semantics,
     // and a wedged host migration is exactly what a remote agent needs to
     // see to explain degraded behavior.
-    const health = await ctx.engine.getHealth(diagnosticScope(ctx));
+    // F4a (O-ENG-13): memoized per engine, scope, config generation and page
+    // clock (src/core/health-memo.ts); engine.getHealth itself stays uncached.
+    const scope = diagnosticScope(ctx);
+    const health = await memoizedHealth(ctx.engine, scope, async () => {
+      const counters = await ctx.engine.getHealth(scope);
+      // #4732: name the column embed_coverage and missing_embeddings measured
+      // (the same resolution getHealth uses), so a 0% coverage on an embedded
+      // brain points at a mis-routed column instead of a paid re-embed.
+      const { name: embedding_column } = await resolveActiveEmbeddingColumnFromEngine(ctx.engine, { fallbackToLegacy: true });
+      return { ...counters, embedding_column };
+    });
     // TODOS:4063 — composed at the OP layer (not BrainEngine.getHealth):
     // the ledger is a filesystem JSONL, engine-agnostic; growing the engine
     // interface would force both engines to duplicate a file read.
@@ -56,9 +78,9 @@ const get_health: Operation = {
     // degrades the field, never the health call.
     let migrations: unknown;
     try {
-      const { migrationLedgerSummary } = await import('../migration-ledger.ts');
+      const { declinedMigrations, migrationLedgerSummary } = await import('../migration-ledger.ts');
       const { VERSION } = await import('../../version.ts');
-      migrations = migrationLedgerSummary(VERSION);
+      migrations = migrationLedgerSummary(VERSION, await declinedMigrations(ctx.engine));
     } catch {
       migrations = { error: 'ledger_unreadable' };
     }
@@ -83,7 +105,10 @@ const get_health: Operation = {
  */
 const get_brain_identity: Operation = {
   name: 'get_brain_identity',
-  description: 'Brain identity + counters for thin-client banner — remote callers see counters confined to their source grant. Returns version, engine kind, and page/chunk counts. Read-scope.',
+  mutating: false,
+  idempotent: true,
+  outputRedaction: 'no_stored_text',
+  description: 'Brain identity + counters for thin-client banner — remote callers see counters confined to their source grant. Returns version, engine kind, page/chunk counts and capabilities (large_pages_v1: windowed get_page). Read-scope.',
   params: {},
   handler: async (ctx) => {
     // #4592: read-scope + unscoped counters made this op the quiet third
@@ -114,6 +139,7 @@ const get_brain_identity: Operation = {
       last_sync_iso: null as string | null,
       update_available,
       latest_version,
+      capabilities: [LARGE_PAGES_CAPABILITY],
     };
   },
   scope: 'read',
@@ -139,6 +165,9 @@ const get_brain_identity: Operation = {
  */
 const run_doctor: Operation = {
   name: 'run_doctor',
+  mutating: false,
+  idempotent: true,
+  outputRedaction: 'no_stored_text',
   description: 'Run brain health checks and return a structured DoctorReport (thin-client doctor surface).',
   params: {},
   handler: async (ctx) => {
@@ -151,7 +180,9 @@ const run_doctor: Operation = {
     // unscoped ctx = brain-wide.
     const scope = sourceScopeOpts(ctx);
     const sourceIds = scope.sourceIds ?? (scope.sourceId ? [scope.sourceId] : undefined);
-    return doctorReportRemote(ctx.engine, { sourceIds });
+    const transport = ctx.remote === false ? 'cli' : ctx.transport ?? 'http';
+    return doctorReportRemote(ctx.engine, { sourceIds, remote: ctx.remote,
+      render: { transport, isCallable: (op) => op === 'run_doctor', preapproved: () => false } });
   },
   scope: 'admin',
   localOnly: false,
@@ -159,14 +190,38 @@ const run_doctor: Operation = {
 
 const get_versions: Operation = {
   name: 'get_versions',
-  description: 'Page version history',
+  mutating: false,
+  idempotent: true,
+  outputRedaction: { exempt: 'full page version snapshots by slug; a page read governed by visibility like get_page (CEO-17)' },
+  description: `Page version history, newest snapshot first: metadata only (id, snapshot_at, title, type, tags, frontmatter) for the newest ${GET_VERSIONS_DEFAULT_LIMIT} versions by default. Pass include_body: true for each version's compiled_truth and timeline, and a larger limit (at most ${GET_VERSIONS_REMOTE_MAX_LIMIT} over MCP) for older versions. Trusted local and admin callers also get written_by and archived_by (who wrote each snapshot and whose write archived it). revert_version takes the id field.`,
   params: {
     slug: { type: 'string', required: true, description: 'Slug of the page whose version history to list.' },
+    limit: { type: 'number', description: `Return only the newest N versions (a positive integer). Default ${GET_VERSIONS_DEFAULT_LIMIT}; MCP callers are capped at ${GET_VERSIONS_REMOTE_MAX_LIMIT}.` },
+    include_body: { type: 'boolean', description: 'true adds compiled_truth and timeline to every version. Default false (metadata only).' },
   },
   handler: async (ctx, p) => {
-    const versions = await ctx.engine.getVersions(p.slug as string, await readPolicyOpts(ctx));
+    // #5234: the bound and the body projection run in SQL, after the scope and
+    // privacy predicates, so a bounded or metadata-only read never loads more
+    // than it returns and never widens what the caller may see.
+    // Large pages: metadata only and the newest 20 by default (100 per MCP
+    // call); one probe row past the limit says whether older versions exist.
+    const { limit, clampedFrom } = pagingLimit(ctx, 'get_versions', p.limit, GET_VERSIONS_DEFAULT_LIMIT, GET_VERSIONS_REMOTE_MAX_LIMIT);
+    const opts = { ...(await readPolicyOpts(ctx)), limit: limit + 1 };
+    const page = <T>(rows: T[]): T[] => {
+      reportVersionPage(ctx, p, { limit, clampedFrom, truncated: rows.length > limit });
+      return rows.slice(0, limit);
+    };
+    if (p.include_body !== true) {
+      // An adapter that ignores includeBody never leaks an unsanitized body through the metadata default.
+      const metadata = page(await ctx.engine.getVersions(p.slug as string, { ...opts, includeBody: false }))
+        .map(v => { const { compiled_truth: _b, timeline: _t, ...rest } = v as typeof v & { compiled_truth?: unknown; timeline?: unknown }; return rest; });
+      return canReadWriteAttribution(ctx) ? attributeVersions(ctx.engine, metadata) : metadata;
+    }
+    const plain = page(await ctx.engine.getVersions(p.slug as string, opts));
+    const versions = canReadWriteAttribution(ctx) ? await attributeVersions(ctx.engine, plain) : plain;
     if (ctx.remote === false) return versions;
-    return versions.map(v => ({ ...v, compiled_truth: sanitizeRemoteBody(v.compiled_truth) }));
+    return versions.map(v => ({ ...v, compiled_truth: sanitizeRemoteBody(v.compiled_truth),
+      ...(typeof v.timeline === 'string' ? { timeline: sanitizeRemoteBody(v.timeline) } : {}) }));
   },
   scope: 'read',
   cliHints: { name: 'history', positional: ['slug'] },
@@ -174,23 +229,22 @@ const get_versions: Operation = {
 
 const revert_version: Operation = {
   name: 'revert_version',
-  description: 'Revert page to a previous version',
+  idempotent: true,
+  outputRedaction: 'no_stored_text',
+  description: 'Restore a page to an earlier version from its history (a new revision; history is kept). Use when an edit must be undone. Needs write scope. On a revision conflict: re-read the page with get_page and resubmit with its revision.',
   params: {
+    ...PAGE_MUTATION_PARAMS,
     slug: { type: 'string', required: true, description: 'Slug of the page to revert.' },
     version_id: { type: 'number', required: true, description: 'Numeric version id to revert to, as returned by get_versions. Not a version NUMBER offset — pass the id field.' },
   },
   mutating: true,
   scope: 'write',
   handler: async (ctx, p) => {
+    const { pageMutationSource, submitPageMutation } = await import('../persistence/page-mutations.ts');
+    pageMutationSource(ctx, p, 'revert_version');
     enforceClientSlugFence(ctx, p.slug as string, 'revert_version');
     if (ctx.dryRun) return { dry_run: true, action: 'revert_version', slug: p.slug, version_id: p.version_id };
-    // v0.31.8 (D7): thread ctx.sourceId so multi-source brains revert the
-    // intended page row instead of whichever same-slug row Postgres returns
-    // first.
-    const sourceOpts = ctx.sourceId ? { sourceId: ctx.sourceId } : {};
-    await ctx.engine.createVersion(p.slug as string, sourceOpts);
-    await ctx.engine.revertToVersion(p.slug as string, p.version_id as number, sourceOpts);
-    return { status: 'reverted' };
+    return submitPageMutation(ctx, { operation: 'revert_version', params: p });
   },
   cliHints: { name: 'revert', positional: ['slug', 'version_id'] },
 };
@@ -206,6 +260,9 @@ const revert_version: Operation = {
  */
 const quarantine_list: Operation = {
   name: 'quarantine_list',
+  mutating: false,
+  idempotent: true,
+  outputRedaction: 'retrieval',
   description:
     'List quarantined (hidden) and optionally content-flagged pages by scanning page ' +
     'frontmatter, newest-updated first. When truncated is true, count is a LOWER BOUND — ' +

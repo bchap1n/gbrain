@@ -37,7 +37,7 @@ function brainBenchEnv(): NodeJS.ProcessEnv {
   return {
     ...process.env,
     GBRAIN_QUIET: '1',
-    // Bare CLI defaults are zembed/1280; its parent bun test uses legacy/1536.
+    // Bare CLI defaults are voyage-4/1024; its parent bun test uses legacy/1536.
     // An absent default fixture falls back to cold init without a wrong-shape tar.
     GBRAIN_PGLITE_SNAPSHOT: snapshot ? resolve(REPO, snapshot) : '',
   };
@@ -423,6 +423,7 @@ describe('run-all once-per-sweep semantics (decision 16)', () => {
     expect(record.suite).toBe('brainbench');
     expect(record.mode).toBe('n/a');
     expect(record.status).toBe('completed');
-    expect(Object.keys(record.params.cells).length).toBe(12);
-  }, 120_000);
+    // 3 harnesses x 8 suites (the four memory-trust suites, #5575, joined the four retrieval/write suites).
+    expect(Object.keys(record.params.cells).length).toBe(24);
+  }, 240_000);
 });

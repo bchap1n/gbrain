@@ -42,7 +42,7 @@ function makeFactory(tools = buildToolDefs([{
   name: 'whoami',
   description: 'who am i',
   params: {},
-  handler: async () => ({}),
+  outputRedaction: 'retrieval',
 }])): McpServerFactory {
   return () => {
     const server = new Server(

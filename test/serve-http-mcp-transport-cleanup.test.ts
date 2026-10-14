@@ -17,13 +17,14 @@
  * factory builds a FRESH `Server` per request (never a shared module-level
  * instance), and NO hand-rolled per-request `new StreamableHTTPServerTransport(`
  * that could bypass the connector's teardown. Auth still wraps the mount
- * with `withBearerScopeHint(..., ['read'])`.
+ * with `withBearerScopeHint`.
  */
 import { describe, test, expect } from 'bun:test';
-import { readFileSync } from 'node:fs';
+import { surfaceFileSource, surfaceSource } from './helpers/source-surface.ts';
 
 describe('POST /mcp transport cleanup (#2844)', () => {
-  const src = readFileSync('src/commands/serve-http.ts', 'utf8');
+  // Refactor wave 1: the POST /mcp handler lives in serve-http-mcp.ts.
+  const src = surfaceFileSource('serve-http', 'src/commands/serve-http-mcp.ts');
 
   test('single stateless createMcpHandler mount; factory builds a fresh Server per request', () => {
     const mountIdx = src.indexOf('createMcpHandler(');
@@ -33,19 +34,24 @@ describe('POST /mcp transport cleanup (#2844)', () => {
     const mount = src.slice(mountIdx, mountIdx + 4000);
     expect(mount).toContain('legacy');
     expect(mount).toContain('stateless');
-    expect(mount).toMatch(/new Server\(\s*\{ name: 'gbrain'/);
+    // The factory reaches the per-request `new Server(` through its builder —
+    // exactly one construction site exists in the file, so a second one (or a
+    // shared module-level instance) fails this count.
+    expect(mount).toContain('createMcpRequestServer(');
+    expect(src.match(/new Server\(/g) ?? []).toHaveLength(1);
   });
 
   test('no hand-rolled per-request StreamableHTTPServerTransport (would bypass connector teardown)', () => {
     expect(src.indexOf('new StreamableHTTPServerTransport(')).toBe(-1);
+    expect(surfaceSource('serve-http').indexOf('new StreamableHTTPServerTransport(')).toBe(-1);
   });
 
-  test('POST /mcp keeps withBearerScopeHint(..., [read]) around the v2 handler', () => {
+  test('POST /mcp keeps withBearerScopeHint around the v2 handler', () => {
     const postIdx = src.indexOf("app.post('/mcp'");
     expect(postIdx).toBeGreaterThan(-1);
     const post = src.slice(postIdx, postIdx + 400);
     expect(post).toContain('withBearerScopeHint');
-    expect(post).toContain("['read']");
-    expect(post).toContain('toNodeHandler(mcpHandler)');
+    expect(post).toContain("['read', 'write']");
+    expect(post).toContain('toNodeHandler(mcpHandler');
   });
 });

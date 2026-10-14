@@ -24,6 +24,7 @@ import { execFileSync, spawn, spawnSync } from 'child_process';
 import { mkdtempSync, mkdirSync, writeFileSync, readFileSync, existsSync, rmSync, copyFileSync, chmodSync, symlinkSync } from 'fs';
 import { tmpdir } from 'os';
 import { dirname, join, resolve } from 'path';
+import { buildSide, loadReceiptDir } from '../../scripts/ci-executed-counts.ts';
 
 const REPO_ROOT = resolve(import.meta.dir, '..', '..');
 const PARALLEL_SH_SRC = resolve(REPO_ROOT, 'scripts/run-unit-parallel.sh');
@@ -284,7 +285,7 @@ describe('passing', () => {
 
     const bin = join(FROOT, 'bin');
     mkdirSync(bin);
-    for (const tool of ['bash', 'sh', 'env', 'dirname', 'basename', 'mktemp', 'date', 'sleep', 'cat', 'tail', 'head', 'rm', 'mkdir', 'pkill', 'grep', 'sed', 'awk', 'wc', 'tr', 'seq', 'find', 'sort', 'bun']) {
+    for (const tool of ['bash', 'sh', 'env', 'dirname', 'basename', 'mktemp', 'date', 'sleep', 'cat', 'tail', 'head', 'rm', 'mkdir', 'pkill', 'grep', 'sed', 'awk', 'wc', 'tr', 'seq', 'find', 'sort', 'tee', 'bun']) {
       const p = Bun.which(tool);
       if (p) symlinkSync(p, join(bin, tool));
     }
@@ -401,6 +402,18 @@ describe('oom-once', () => {
     expect(r.stdout + r.stderr).toContain('OOM rescue pass');
     expect(r.stderr).toContain('oom_rescued=');
     expect(r.code).toBe(0);
+  }, 120_000);
+
+  it('writes a receipt per bun invocation; the rescue receipt supersedes the phantom failure (X2)', () => {
+    const r = runOom();
+    expect(r.code).toBe(0);
+    const dir = join(OROOT, '.context', 'test-receipts');
+    const receipts = loadReceiptDir(dir);
+    expect(receipts.filter(x => x.kind === 'rescue').map(x => [x.lane, x.files])).toEqual([['unit', ['test/b-oom-once.test.ts']]]);
+    expect(receipts.filter(x => x.kind === 'primary' && x.lane === 'unit').map(x => x.files[0]).sort()).toEqual(['test/a-pass.test.ts', 'test/b-oom-once.test.ts']);
+    const side = buildSide('local', receipts);
+    expect(side.issues).toEqual([]);
+    expect(side.lanes.get('unit')).toMatchObject({ executed: 2, failed: 0, superseded: 1 });
   }, 120_000);
 
   it('GBRAIN_TEST_NO_OOM_FALLBACK=1 disables the rescue lane (stays red)', () => {
@@ -551,7 +564,7 @@ describe('hanging', () => { it('sleeps past the shard cap', async () => { await 
     // so the fallback branch executes even on hosts with coreutils.
     const bin = join(WROOT, 'bin');
     mkdirSync(bin);
-    for (const tool of ['bash', 'sh', 'env', 'dirname', 'basename', 'mktemp', 'date', 'sleep', 'cat', 'tail', 'head', 'rm', 'mkdir', 'pkill', 'grep', 'sed', 'awk', 'wc', 'tr', 'seq', 'find', 'sort', 'touch', 'stat', 'bun']) {
+    for (const tool of ['bash', 'sh', 'env', 'dirname', 'basename', 'mktemp', 'date', 'sleep', 'cat', 'tail', 'head', 'rm', 'mkdir', 'pkill', 'grep', 'sed', 'awk', 'wc', 'tr', 'seq', 'find', 'sort', 'touch', 'stat', 'tee', 'bun']) {
       const p = Bun.which(tool);
       if (p) symlinkSync(p, join(bin, tool));
     }
