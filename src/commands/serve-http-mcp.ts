@@ -6,14 +6,14 @@
  */
 import { createHash } from 'node:crypto';
 import type { Express, Request, Response } from 'express';
-import { Server, createMcpHandler, type ListToolsResult, type CallToolResult, type CallToolRequest } from '@modelcontextprotocol/server';
+import { Server, createMcpHandler, DEFAULT_MAX_REQUEST_BODY_SIZE, type ListToolsResult, type CallToolResult, type CallToolRequest } from '@modelcontextprotocol/server';
 import { toNodeHandler } from '@modelcontextprotocol/node';
 import { requireBearerAuth } from '@modelcontextprotocol/express';
 import { opAllowedForBoundClient } from '../core/operations.ts';
 import { authTransport } from '../core/ops/contract.ts';
 import type { AuthInfo, Operation } from '../core/operations.ts';
 import { disabledOpsForPublishGates } from '../mcp/publish-gates.ts';
-import { installInstructionsResolver, resolveMcpInstructions } from '../mcp/instructions.ts';
+import { installInstructionsResolver, readInstructionContent, resolveMcpInstructions } from '../mcp/instructions.ts';
 import { httpInstructionTools } from '../mcp/initialize-context.ts';
 import { installCapabilitiesResource, mcpAdministrationGuidance } from '../mcp/capabilities.ts';
 import { createSkillResources } from '../mcp/skill-resources.ts';
@@ -42,8 +42,11 @@ import { getBrainHotMemoryMeta } from '../core/facts/meta-hook.ts';
 import { serializeError } from '../core/errors.ts';
 import { VERSION } from '../version.ts';
 import { executeRawJsonb } from '../core/sql-query.ts';
+import { withRequestConfigSnapshot } from '../core/config-snapshot.ts';
 import { withBearerScopeHint } from './serve-http-oauth.ts';
 import type { ServeHttpContext } from './serve-http.ts';
+
+type McpCallContext = Parameters<Parameters<typeof createMcpHandler>[0]>[0];
 
 /** Per-request state shared by the tools/list and tools/call handlers of one POST /mcp. */
 interface McpRequestState {
@@ -127,7 +130,10 @@ export function mountMcp(app: Express, ctx: ServeHttpContext): void {
   // the switch. The connector owns the per-request lifecycle (the v1 form
   // needed a hand-rolled `res.on('close')` teardown, #2844): each request gets
   // a FRESH `Server` from the factory below, never a shared instance.
-  const mcpHandler = createMcpHandler(async (mcpCtx): Promise<Server> => {
+  // #6721: one config snapshot serves every config read of one POST /mcp.
+  const mcpHandler = createMcpHandler((mcpCtx): Promise<Server> => withRequestConfigSnapshot(engine, () => requestServer(mcpCtx)), { legacy: 'stateless' });
+
+  async function requestServer(mcpCtx: McpCallContext): Promise<Server> {
     const startTime = Date.now();
     // toNodeHandler forwards the bearer middleware's `req.auth` (gbrain's
     // extended AuthInfo, threaded through by verifyAccessToken) as
@@ -176,7 +182,7 @@ export function mountMcp(app: Express, ctx: ServeHttpContext): void {
     const thinClient = isGbrainThinClient(clientHeader);
     const state: McpRequestState = { authInfo, agentName, startTime, mcpOperations, surface, surfaceCeiling, surfaceAllowedOps, resultRows, thinClient };
     return createMcpRequestServer(ctx, state, writeback);
-  }, { legacy: 'stateless' });
+  }
 
   app.post('/mcp', withBearerScopeHint(
     requireBearerAuth({ verifier: resourceVerifier, resourceMetadataUrl }), ['read', 'write'],
@@ -221,6 +227,7 @@ function createMcpRequestServer(
   installInstructionsResolver(server, async () => resolveMcpInstructions(config, process.env, {
     writeback: writebackOpts,
     tools: await httpInstructionTools(engine, config, { ops: mcpOperations, surface, auth: authInfo, allowedOps: surfaceAllowedOps, cache: ctx.readinessCache }),
+    ...await readInstructionContent(engine),
   }));
   installCapabilitiesResource(server, async () => {
     return { transport: authTransport(authInfo), client_id: authInfo.clientId,
@@ -416,9 +423,12 @@ async function callMcpTool(ctx: ServeHttpContext, state: McpRequestState, reques
   try {
     toolResult = await dispatchToolCall(engine, name, params as Record<string, unknown> | undefined, {
       remote: true,
+      admissionOrigin: 'interactive',
+      config: ctx.config,
       // WP1/D7: network transport — the dispatch-layer localOnly
       // backstop keys off this marker.
       transport: 'http',
+      inboundFrameBytes: DEFAULT_MAX_REQUEST_BODY_SIZE,
       ...(sessionId ? { sessionId } : {}),
       takesHoldersAllowList: tokenAllowList,
       sourceId: tokenSourceId,

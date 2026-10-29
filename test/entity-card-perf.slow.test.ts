@@ -154,15 +154,22 @@ beforeAll(async () => {
 
   // Links: filler→filler hub noise plus a fan-in/out around every target
   // (the card reads getLinks/getBacklinks — targets must have real edges).
+  // #6646: g is in the join predicate (7919·g mod PAGES is distinct and non-zero for g = 1..5), so each filler page
+  // gets LINKS/PAGES distinct targets; the cross join used to run after the join and every edge was produced 5 times.
   await db.query(
     `INSERT INTO links (from_page_id, to_page_id, link_type, link_source)
      SELECT p1.id, p2.id, 'mentions', 'mentions'
      FROM (SELECT id, row_number() OVER (ORDER BY id) rn FROM pages WHERE slug LIKE 'filler/%') p1
-     JOIN (SELECT id, row_number() OVER (ORDER BY id) rn FROM pages WHERE slug LIKE 'filler/%') p2
-       ON p2.rn = ((p1.rn * 7919) % ${PAGES}) + 1 AND p1.id <> p2.id
      CROSS JOIN generate_series(1, ${Math.ceil(LINKS / PAGES)}) g
+     JOIN (SELECT id, row_number() OVER (ORDER BY id) rn FROM pages WHERE slug LIKE 'filler/%') p2
+       ON p2.rn = ((p1.rn + 7919 * g) % ${PAGES}) + 1 AND p1.id <> p2.id
      ON CONFLICT DO NOTHING`,
   );
+  const [{ n: fillerLinks }] = (await db.query(
+    `SELECT count(*)::int AS n FROM links l JOIN pages a ON a.id = l.from_page_id JOIN pages b ON b.id = l.to_page_id
+      WHERE a.slug LIKE 'filler/%' AND b.slug LIKE 'filler/%'`,
+  )).rows as Array<{ n: number }>;
+  expect(fillerLinks).toBe(LINKS);
   await db.query(
     `INSERT INTO links (from_page_id, to_page_id, link_type, link_source)
      SELECT t.id, f.id, 'works_at', 'markdown'
@@ -441,5 +448,86 @@ describe('delta p99 latency gate (v0.45.7 ambient recall)', () => {
     expect(lastOverflow).toBe(true);
     expect(lastFacts).toBeGreaterThan(0);
     expect(p99).toBeLessThan(BOUNDARY_P99_BUDGET_MS);
+  }, 300_000);
+});
+
+// F1: `entity names` with the reference fields and records, 50 names with two identity siblings each (150 target
+// pages). Gates: one batched referrer read per call (2 statements whatever the name count), and the reference phase
+// adds at most REFERENCES_ADDED_CEILING to the same call with every reference field off (the names lookup itself, 50
+// card resolutions, is the baseline; measured in pairs so runner load lands on both).
+const REFERENCES_ADDED_CEILING = 0.5;
+// Measured pairs. 40 CI runs (Oct 22-25) of the old wall-clock ratio of two medians of 10 read median 16.5%, a tail
+// to 38.5%, and one 51.8% failure: wall time counts time off the CPU. Thread CPU time in pairs reads 14-16% here.
+const NAMES_RECORDS_PAIRS = 20;
+describe('entity names with records (50 names, 150 target pages)', () => {
+  it(`50 names with siblings: references add at most ${REFERENCES_ADDED_CEILING * 100}% and a constant number of referrer statements`, async () => {
+    const { lookupEntityNames } = await import('../src/core/verbs/entity-names.ts');
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const db = (engine as any).db;
+    for (let i = 0; i < 50; i++) {
+      for (const [prefix, label] of [['crm', 'CRM record'], ['accounts', 'Account sheet'], ['deals', 'Deal room']]) {
+        await engine.putPage(`${prefix}/perf-account-${i}`, { type: 'company', title: `${label}: Perf Account ${i}`, compiled_truth: `Perf Account ${i}.`, frontmatter: {} }, { sourceId: 'default' });
+      }
+    }
+    await db.query(
+      `INSERT INTO links (from_page_id, to_page_id, link_type, link_source)
+       SELECT f.id, t.id, '', 'markdown'
+         FROM (SELECT id, row_number() OVER (ORDER BY id) rn FROM pages WHERE type = 'contract' ORDER BY id LIMIT 1500) f
+         JOIN (SELECT id, row_number() OVER (ORDER BY id) rn FROM pages WHERE slug LIKE '%/perf-account-%') t ON (f.rn % 150) + 1 = t.rn
+       ON CONFLICT DO NOTHING`);
+    await engine.executeRaw('ANALYZE pages, links');
+    const names = Array.from({ length: 50 }, (_, i) => `crm/perf-account-${i}`);
+    let referrerStatements = 0;
+    const raw = engine.executeRaw.bind(engine);
+    engine.executeRaw = ((sql: string, params?: unknown[]) => {
+      if (sql.includes('refs AS MATERIALIZED')) referrerStatements++;
+      return raw(sql, params as never);
+    }) as typeof engine.executeRaw;
+    const on = async () => { await engine.setConfig('entity.record_types', 'contract'); await engine.unsetConfig('entity.names_references'); };
+    const off = async () => { await engine.unsetConfig('entity.record_types'); await engine.setConfig('entity.names_references', 'false'); };
+    try {
+      for (let i = 0; i < 2; i++) { await on(); await lookupEntityNames(engine, 'default', names, { remote: true }); await off(); await lookupEntityNames(engine, 'default', names, { remote: true }); }
+      // Each pair times both calls back to back on this thread's CPU (sample(): time spent off the CPU is not counted,
+      // a window the hypervisor stole from is timed again). The pair order alternates, and the gate is the median of
+      // the per-pair ratios.
+      const ratios: number[] = [];
+      const pairs: Array<{ refs: Sample; base: Sample }> = [];
+      let last: Awaited<ReturnType<typeof lookupEntityNames>> | null = null;
+      let statements = 0;
+      const timed = async (refsOn: boolean): Promise<Sample> => {
+        await (refsOn ? on() : off());
+        return sample(refsOn ? 'references' : 'base', async () => {
+          referrerStatements = 0;
+          const result = await lookupEntityNames(engine, 'default', names, { remote: true });
+          if (refsOn) last = result;
+        });
+      };
+      for (let i = 0; i < NAMES_RECORDS_PAIRS; i++) {
+        let refs: Sample, base: Sample;
+        if (i % 2 === 0) { refs = await timed(true); statements += referrerStatements; base = await timed(false); }
+        else { base = await timed(false); refs = await timed(true); statements += referrerStatements; }
+        pairs.push({ refs, base });
+        ratios.push(refs.cpu / base.cpu);
+      }
+      ratios.sort((a, b) => a - b);
+      const added = percentile(ratios, 50) - 1;
+      const median = (xs: number[]) => percentile([...xs].sort((a, b) => a - b), 50);
+      // eslint-disable-next-line no-console
+      console.log(`[entity-names-records-perf] 50 names / 150 targets with references cpu p50=${median(pairs.map(x => x.refs.cpu)).toFixed(2)}ms ` +
+        `| all reference fields off cpu p50=${median(pairs.map(x => x.base.cpu)).toFixed(2)}ms | added=${(added * 100).toFixed(1)}% ` +
+        `(median of ${NAMES_RECORDS_PAIRS} paired ratios, ${(ratios[0]! * 100 - 100).toFixed(1)}%..${(ratios.at(-1)! * 100 - 100).toFixed(1)}%; ceiling ${REFERENCES_ADDED_CEILING * 100}%)`);
+      // eslint-disable-next-line no-console
+      console.log(`[entity-names-records-perf] slowest: ${slowest(pairs.flatMap(x => [x.refs, x.base]))}`);
+      const rows = last!.results.flatMap(r => (r.found ? [r, ...(r.siblings ?? [])] : []));
+      expect(rows).toHaveLength(150);
+      expect(rows.every(r => typeof r.referenced_by_count === 'number' && Array.isArray(r.records))).toBe(true);
+      expect(rows.reduce((n, r) => n + (r.records ?? []).reduce((m, g) => m + g.rows.length, 0), 0)).toBe(24);
+      expect(statements).toBe(NAMES_RECORDS_PAIRS * 2);
+      expect(added).toBeLessThanOrEqual(REFERENCES_ADDED_CEILING);
+    } finally {
+      engine.executeRaw = raw;
+      await engine.unsetConfig('entity.record_types');
+      await engine.unsetConfig('entity.names_references');
+    }
   }, 300_000);
 });

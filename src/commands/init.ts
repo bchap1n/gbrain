@@ -1,4 +1,4 @@
-import { execSync } from 'child_process';
+import { execSync } from '../core/spawn.ts';
 import { readdirSync, lstatSync, existsSync, copyFileSync, mkdirSync, readFileSync } from 'fs';
 import { join, dirname } from 'path';
 import { fileURLToPath } from 'url';
@@ -26,7 +26,9 @@ import type { McpSurface } from '../mcp/surface.ts';
 
 /** D2: `--json` writes exactly one document, after whichever branch ran (see init-json.ts). */
 export async function runInit(args: string[]) {
+  const fresh = !existsSync(configPath());
   await runInitBranches(args);
+  if (fresh && existsSync(configPath())) (await import('../core/funnel.ts')).recordFunnelEvent('clean_install');
   if (args.includes('--json')) await flushInitJsonResult();
 }
 

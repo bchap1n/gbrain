@@ -225,8 +225,26 @@ for (const backend of testBackends()) describe(`#6643 maintenance file drift (${
     expect(JSON.stringify(reader)).not.toContain(root);
     const fenced = await listConflicts.handler(remote({ boundSlugPrefixes: ['people/'] }), { source_id: sourceId }) as { conflicts: Array<{ slug: string }> };
     expect(fenced.conflicts.map(row => row.slug)).toEqual(['people/alice-example']);
-    const elsewhere = await listConflicts.handler(remote({ allowedSources: ['other-source'] }), { source_id: sourceId }) as { conflicts: unknown[]; totals: { slugs: number } };
-    expect(elsewhere).toMatchObject({ conflicts: [], totals: { slugs: 0 } });
+    // A source outside the grant is refused like every source-scoped read, the same whether it exists or not (no existence oracle).
+    for (const named of [sourceId, 'unregistered-example']) {
+      await expect(listConflicts.handler(remote({ allowedSources: ['other-source'] }), { source_id: named })).rejects.toMatchObject({ code: 'permission_denied' });
+    }
+    // The window is bounded by this source's own requests: writes in another source do not move it.
+    const before = await listConflicts.handler(remote({}), { source_id: sourceId }) as { window: Record<string, unknown>; next: string | null };
+    const other = `d6643-other-${randomUUID().slice(0, 8)}`;
+    await engine.executeRaw('UPDATE persistence_brain SET enabled=false WHERE singleton=1');
+    await engine.executeRaw('INSERT INTO sources(id,name,local_path) VALUES($1,$1,$2)', [other, join(root, '..', 'other')]);
+    await engine.executeRaw('UPDATE persistence_brain SET enabled=true WHERE singleton=1');
+    await engine.executeRaw(`INSERT INTO persistence_requests(principal_kind,principal_id,request_id,operation,source_id,source_incarnation,slug,digest,intent,authority,intent_bytes,terminal_reservation,state)
+      SELECT 'local_cli','other',gen_random_uuid(),'put_page',$1,(SELECT incarnation FROM sources WHERE id=$1),'notes/n-'||g,'d','{}'::jsonb,'{}'::jsonb,1,16384,'committed'
+      FROM generate_series(1,5) g`, [other]);
+    const [{ top }] = await engine.executeRaw<{ top: string }>('SELECT max(sequence)::text AS top FROM persistence_requests');
+    const after = await listConflicts.handler(remote({}), { source_id: sourceId }) as { window: Record<string, unknown> };
+    expect(after.window).toEqual(before.window);
+    expect(after.window.through_sequence).not.toBe(top);
+    // A cursor naming a later sequence is clamped to the source's own newest request.
+    const forged = await listConflicts.handler(remote({}), { source_id: sourceId, cursor: `${top}:` }) as { window: Record<string, unknown> };
+    expect(forged.window.through_sequence).toBe(before.window.through_sequence);
   }), 240_000);
 
   test('--all-drifted refuses mixed drift classes unless --class keeps one', () => fixture(async ({ root, sourceId, ctx }) => {
@@ -294,6 +312,41 @@ for (const backend of testBackends()) describe(`#6643 maintenance file drift (${
     expect(readFileSync(join(root, 'notes/one.md'), 'utf8')).not.toContain('owner: alice-example');
     expect((await liveFileDrift(engine, sourceId, 'notes/two')).still_present).toBe(true);
     await expect(apply()).rejects.toMatchObject({ code: 'preview_changed' });
+  }), 240_000);
+
+  /** #7145: moves the request sequence past the doctor window, so every receipt written so far is older than it. */
+  const pastWindow = async (ctx: OperationContext, slug: string) => {
+    await engine.executeRaw(`SELECT setval(pg_get_serial_sequence('persistence_requests','sequence'), (SELECT max(sequence) FROM persistence_requests) + 30000)`);
+    await put(ctx, slug, '---\ntype: note\ntitle: Later\n---\nA later write.\n');
+  };
+
+  test('#7145: a drifted page whose only receipt is older than the doctor window is still reported', () => fixture(async ({ root, sourceId, ctx }) => {
+    await put(ctx, 'notes/alpha', '---\ntype: note\ntitle: Alpha\n---\nAlpha.\n');
+    drift(root, 'notes/alpha', text => `${text}\nEdited in the file only.\n`);
+    await refusedWrite(ctx, 'notes/alpha', 'One.');
+    await pastWindow(ctx, 'notes/later');
+    const doctor = await maintenanceWriteDriftCheck(engine, [sourceId]);
+    expect(doctor).toMatchObject({ name: 'maintenance_write_drift', status: 'warn', details: { count: 1 } });
+    expect(doctor.details!.sources).toEqual([expect.objectContaining({ source_id: sourceId, drifted: 1, unchecked: 0 })]);
+  }), 240_000);
+
+  test('#7145: candidates past the live-check limit make a clear result unknown, not ok', () => fixture(async ({ root, sourceId, ctx }) => {
+    await put(ctx, 'notes/alpha', '---\ntype: note\ntitle: Alpha\n---\nAlpha.\n');
+    const original = readFileSync(join(root, 'notes/alpha.md'), 'utf8');
+    drift(root, 'notes/alpha', text => `${text}\nEdited in the file only.\n`);
+    await refusedWrite(ctx, 'notes/alpha', 'One.');
+    writeFileSync(join(root, 'notes/alpha.md'), original);
+    await engine.executeRaw(`INSERT INTO persistence_requests (principal_kind, principal_id, request_id, operation, source_id, source_incarnation, slug, digest, authority,
+        state, intent_bytes, terminal_reservation, error_code, error_message)
+      SELECT r.principal_kind, r.principal_id, gen_random_uuid(), r.operation, r.source_id, r.source_incarnation, 'notes/zz-' || lpad(n::text, 3, '0'), r.digest, r.authority,
+        r.state, r.intent_bytes, r.terminal_reservation, r.error_code, r.error_message
+      FROM persistence_requests r, generate_series(1, 105) n WHERE r.source_id=$1 AND r.state='conflict' AND r.slug='notes/alpha'`, [sourceId]);
+    const doctor = await maintenanceWriteDriftCheck(engine, [sourceId]);
+    expect(doctor).toMatchObject({ name: 'maintenance_write_drift', status: 'warn',
+      details: { count: 0, exact: false, health: 'unknown', reason: 'bound', bound: 'rows', limit: 100 } });
+    expect(doctor.details!.unchecked).toBeGreaterThan(0);
+    expect(doctor.message).toContain('Maintenance write drift unknown');
+    expect(doctor.message).toContain('--window 1000000');
   }), 240_000);
 });
 

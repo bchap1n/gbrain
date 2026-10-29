@@ -2,7 +2,7 @@
 import { OperationError, opError, type Operation, type OperationContext } from './contract.ts';
 import { invalidParam, readFix } from './op-fix.ts';
 import { isValidSourceId } from '../source-id.ts';
-import { enforceBoundClientOpAllowList, enforceClientSlugFence, enforceSubagentSlugFence, normalizeSlugPrefix, parseSourceIdParam, readPolicyOpts } from './context.ts';
+import { enforceBoundClientOpAllowList, enforceClientSlugFence, enforceSubagentSlugFence, normalizeSlugPrefix, parseSourceIdParam, readPolicyOpts, resolveRequestedScope } from './context.ts';
 import { hasScope } from '../scope.ts';
 import { normalizeTokenScopes } from '../legacy-token-scope.ts';
 import { parseWriteRequestId } from '../persistence/preconditions.ts';
@@ -118,15 +118,20 @@ async function publicReceipt(ctx: OperationContext, row: WriteRequest, facts?: W
   const terminal = isTerminalOrRecovering(row) ? (await import('../persistence/terminal-classify.ts')).classifyTerminal({ request_id: row.request_id, source_id: row.source_id,
     slug: row.slug, operation: row.operation, state: row.state, error_code: row.error_code, error_detail: row.error_detail ?? null, recovery: row.recovery,
     blocked_reason: row.blocked_reason, compacted: row.compacted, publication_started: row.publication_started, error_message: row.error_message,
-    intent_kind: typeof row.intent?.kind === 'string' ? row.intent.kind : null, build: (row as { admitter_version?: string | null }).admitter_version ?? null }) : null;
+    intent_kind: typeof row.intent?.kind === 'string' ? row.intent.kind : null, build: (row as { admitter_version?: string | null }).admitter_version ?? null,
+    schema_behind: await (await import('../persistence/schema-admission.ts')).readSchemaBehind(ctx.engine) }) : null;
   const { cliRenderContext, renderAction } = await import('../agent-output.ts');
   const render = ctx.remote === false ? cliRenderContext() : { transport: 'stdio' as const, isCallable: () => false, preapproved: () => false };
+  const { liveSearchable } = await import('../persistence/searchable.ts');
   return {
     ...publicWriteReceipt(receiptFor(row, facts)),
     operation: row.operation, source_id: row.source_id, slug: row.slug,
+    ...await liveSearchable(ctx, { request_id: row.request_id, state: row.state, source_id: row.source_id, slug: row.slug, searchable: row.outcome?.searchable }),
     ...(mismatch ? { owner_build: mismatch } : {}),
+    // #7112: the owner-side detail (an owner exception's class, errno, frame, redacted database error text and statement) for a trusted local reader only.
+    ...(ctx.remote === false && row.error_detail ? { error_detail: row.error_detail } : {}),
     ...(diagnostic ? { write_error: row.error_code, write_error_message: diagnostic.message, write_error_reason: diagnostic.reason, suggestion: diagnostic.suggestion } : {}),
-    ...(terminal ? { diagnosis: { category: terminal.category, code: terminal.code, class: terminal.class, safe_actions: terminal.safe_actions, needs_human: terminal.needs_human,
+    ...(terminal ? { diagnosis: { category: terminal.category, public_category: terminal.public_category, code: terminal.code, class: terminal.class, safe_actions: terminal.safe_actions, needs_human: terminal.needs_human,
       ...(terminal.human_reason ? { human_reason: terminal.human_reason } : {}), escalate: terminal.escalate, historical: terminal.historical,
       fix: renderAction(terminal.action, render) } } : {}),
     ...(withdrawn ? { withdrawn } : {}),
@@ -157,7 +162,8 @@ export const persistenceOperations: Operation[] = [
     idempotent: true,
     outputRedaction: 'no_stored_text',
     description: 'Your write\'s receipt by request_id (after write_pending or a lost reply). Poll at retry_after_ms until final.',
-    params: { request_id: requestParam },
+    params: { request_id: requestParam,
+      applied: { type: 'boolean', fullSurfaceOnly: true, description: 'Also return applied: searchable yet, the gap, the write watermark.' } },
     scope: 'write', mutating: false, area: 'pages',
     cliHints: { name: 'write-request', positional: ['request_id'] },
     handler: async (ctx, params) => {
@@ -166,7 +172,10 @@ export const persistenceOperations: Operation[] = [
       const { getWriteRequest, writeHealthFacts } = await import('../persistence/journal.ts');
       const row = await getWriteRequest(ctx.engine, principal, id);
       if (!row || !await visible(ctx, row)) throw missing(callerSource(ctx));
-      return publicReceipt(ctx, row, (await writeHealthFacts(ctx.engine, [row])).get(row.id));
+      const receipt = await publicReceipt(ctx, row, (await writeHealthFacts(ctx.engine, [row])).get(row.id));
+      if (params.applied !== true) return receipt;
+      const applied = await (await import('../persistence/write-applied.ts')).readWriteApplied(ctx.engine, row).catch(() => null);
+      return applied ? { ...receipt, applied } : receipt;
     },
   },
   {
@@ -176,7 +185,7 @@ export const persistenceOperations: Operation[] = [
     description: 'Your write receipts in one source, newest first (for a lost request_id).',
     params: {
       source_id: { type: 'string', description: 'Default: yours.' },
-      limit: { type: 'number', default: 25, description: '1-100 (default 25).' },
+      limit: { type: 'number', default: 25, description: '1-100 (default 25).', fullSurfaceOnly: true },
       before: { type: 'string', description: "Previous page's next cursor." },
     },
     scope: 'write', mutating: false, area: 'pages',
@@ -218,6 +227,8 @@ export const persistenceOperations: Operation[] = [
     cliHints: { name: 'write-conflicts' },
     handler: async (ctx, params) => {
       const sourceId = parseSourceIdParam(params.source_id ?? ctx.sourceId, 'list_write_conflicts') ?? 'default';
+      // A remote caller naming a source outside its grant is refused like every source-scoped read (permission_denied, whether or not it exists).
+      if (params.source_id !== undefined) resolveRequestedScope(ctx, sourceId);
       const limit = params.limit ?? 25;
       if (typeof limit !== 'number' || !Number.isInteger(limit) || limit < 1 || limit > 100) throw invalidParam(ctx, 'list_write_conflicts', 'limit', 'limit must be an integer from 1 to 100.', { example: 25 });
       if (params.cursor !== undefined && typeof params.cursor !== 'string') throw opError('invalid_params', 'Invalid conflict cursor.', "Pass `cursor` exactly as the previous response's `next` value.");

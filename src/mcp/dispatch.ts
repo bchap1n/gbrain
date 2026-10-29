@@ -6,12 +6,14 @@
  * + missing-context bugs; this module exists to prevent that recurring.
  */
 
+import { writeReceiptCapacityNotices } from '../core/persistence/capacity-snapshot.ts';
 import { affectsRecall } from '../core/types.ts';
 import type { BrainEngine } from '../core/engine.ts';
 import { operations, OperationError, enforceBoundClientOpAllowList, opError } from '../core/operations.ts';
 import type { OperationContext, AuthInfo } from '../core/operations.ts';
 import type { OperationMeta } from '../core/ops/contract.ts';
 import { loadConfig } from '../core/config.ts';
+import { withRequestConfigSnapshot, withoutRequestConfigSnapshot } from '../core/config-snapshot.ts';
 import { resolveBrainId } from '../core/brain-resolver.ts';
 import { getCliOptions } from '../core/cli-options.ts';
 import { VERB_NAMES, MEMORY_VERBS_VERSION } from '../core/verbs.ts';
@@ -19,10 +21,11 @@ import { cliRenderContext, orderNotices, redactForTransport, renderNotice, toAge
 import { cliOnlyRefusal, isCallable } from '../core/ops/callable.ts';
 import { hostFix, scopeDeniedError } from '../core/ops/op-fix.ts';
 import { mutedNoticeCodes, processNoticeLedger, __resetProcessNoticeLedgerForTests, type NoticeLedger, type NoticeAudience } from '../core/notice-ledger.ts';
-import { logVerbUsage } from '../core/verbs/usage-log.ts';
+import { logVerbUsage, recordsFiring, type RecordsFiring } from '../core/verbs/usage-log.ts';
 import { searchCountLine } from '../core/search/keyword-paging.ts';
 import { dateLabelLine } from '../core/search/date-labels.ts';
 import { hiddenTakesNotice, localTranscriptsNotice, recallInteropNotices, wantsTranscriptHint } from '../core/interop-notices.ts';
+import { unreadableSourcesNotice } from '../core/unreadable-sources-notice.ts';
 import { hiddenToolHint, hiddenToolNext, hiddenToolRoute, type ToolConnection } from './hidden-tool-hint.ts';
 import { opAllowedForBoundClient } from '../core/ops/context.ts';
 import { takePostUpgradeMcpNotice } from '../core/post-upgrade-notice.ts';
@@ -45,8 +48,10 @@ import { maybeRefreshBackupStatusInProcess } from '../core/backup/coverage.ts';
 import { operationScopesAllowed } from '../core/scope.ts';
 import { enforceReadTrustFloor } from '../core/eligibility/registry.ts';
 import { invalidateHotMemoryForEngine } from '../core/facts/meta-hook.ts';
+import { withSearchConnectionBudget } from '../core/search/connection-budget.ts';
+import { isEngineDegraded } from '../core/degraded-marker.ts';
 import { admittedPendingReceipt, type WriteReceipt } from '../core/persistence/types.ts';
-import { currentVerifiedLocalWriter, readLocalWriter, verifyLocalWriter, withVerifiedLocalRegistration } from '../core/persistence/identity.ts';
+import { currentVerifiedLocalWriter, readLocalWriter, verifyLocalWriter, withRequestIdentityMemo, withVerifiedLocalRegistration } from '../core/persistence/identity.ts';
 import { frameOverCap, resultTooLargeError } from '../core/egress-budget.ts';
 
 // WP3: normalization + validation moved to validate-params.ts (direct unit
@@ -159,6 +164,8 @@ export interface ToolResult {
 }
 
 export interface DispatchOpts {
+  /** #6696 (A5): set by the trusted transport for the user's own agent calls; never from wire params. */
+  admissionOrigin?: OperationContext['admissionOrigin'];
   /** Configuration selected by the resident transport, never populated from wire params. */
   config?: OperationContext['config'];
   /** Defaults to true (remote/untrusted). Local CLI callers (`gbrain call`) pass false. */
@@ -174,6 +181,8 @@ export interface DispatchOpts {
    * 'http', and an unset marker is treated as non-local, fail-closed.
    */
   transport?: OperationContext['transport'];
+  /** The transport's inbound frame cap (OperationContext.inboundFrameBytes). */
+  inboundFrameBytes?: number;
   /**
    * v0.28: per-token allow-list for the takes.holder field. Threaded by
    * the HTTP/stdio transport from `access_tokens.permissions.takes_holders`.
@@ -830,6 +839,7 @@ export function buildOperationContext(
     dryRun: !!params.dry_run,
     remote: opts.remote ?? true,
     transport: opts.transport,
+    ...(opts.inboundFrameBytes !== undefined ? { inboundFrameBytes: opts.inboundFrameBytes } : {}),
     takesHoldersAllowList: opts.takesHoldersAllowList,
     // v0.34 D4: sourceId is REQUIRED at the type level. Auto-fill 'default'
     // for single-source brains and any caller who didn't resolve a sourceId.
@@ -843,6 +853,7 @@ export function buildOperationContext(
     ...(opts.stdioSurface ? { stdioSurface: opts.stdioSurface } : {}),
     ...(opts.revealTools ? { revealTools: opts.revealTools } : {}),
     ...(opts.writeWaitMs !== undefined ? { writeWaitMs: opts.writeWaitMs } : {}),
+    ...(opts.admissionOrigin ? { admissionOrigin: opts.admissionOrigin } : {}),
     ...(opts.resultRows ? { resultRows: opts.resultRows } : {}),
     ...(opts.thinClient ? { thinClient: true } : {}),
     isCallable: (opName: string) => (render ??= dispatchRenderContext(opts)).isCallable(opName),
@@ -862,11 +873,33 @@ export async function dispatchToolCall(
   params: Record<string, unknown> | undefined,
   opts: DispatchOpts = {},
 ): Promise<ToolResult> {
+  // #6721: a read op answers every config read from one snapshot of the table
+  // (config-snapshot.ts); a write reads config live, so it sees its own writes.
+  // GBRA-156: and reads the brain identity and each local writer's credential once for its pre-submission checks.
+  const run = () => withRequestIdentityMemo(() => dispatchResolvedCall(engine, name, params, opts));
+  if (name === 'search' || name === 'query') return withSearchConnectionBudget(() => withRequestConfigSnapshot(engine, run));
+  return operations.find(o => o.name === name)?.mutating === false
+    ? withRequestConfigSnapshot(engine, run)
+    : withoutRequestConfigSnapshot(run);
+}
+
+/** The response-meta hook's keys, or its failure message; never rejects (a hook failure degrades to no keys). */
+async function runMetaHook(hook: NonNullable<DispatchOpts['metaHook']>, name: string, ctx: OperationContext): Promise<{ meta?: Record<string, unknown>; failure?: string }> {
+  try { return { meta: await hook(name, ctx) }; }
+  catch (metaErr) { return { failure: metaErr instanceof Error ? metaErr.message : String(metaErr) }; }
+}
+
+async function dispatchResolvedCall(
+  engine: BrainEngine,
+  name: string,
+  params: Record<string, unknown> | undefined,
+  opts: DispatchOpts,
+): Promise<ToolResult> {
   const startedMs = Date.now();
   const isVerb = VERB_NAME_SET.has(name);
   // [c11] dispatch-layer usage sidecar for the five verbs — counts validation
   // failures too. Fire-and-forget; never awaited, never throws.
-  const logVerb = (ok: boolean, extra?: { budget_dropped?: number; entity_found?: boolean; remember_status?: string }) => {
+  const logVerb = (ok: boolean, extra?: { budget_dropped?: number; entity_found?: boolean; remember_status?: string; records_firing?: RecordsFiring }) => {
     if (!isVerb) return;
     logVerbUsage({
       verb: name,
@@ -1041,6 +1074,8 @@ export async function dispatchToolCall(
     enforceBoundClientOpAllowList(ctx.auth, op);
     // #5575 CEO-18: a floored connection only reaches read ops that enforce its floor.
     enforceReadTrustFloor(ctx.auth, op);
+    // GBRA-156: a read op does not change what the hook reads, so it runs beside the handler (a degraded engine's reconnect stays the handler's).
+    const earlyMeta = opts.metaHook && op.mutating === false && !isEngineDegraded(engine) ? runMetaHook(opts.metaHook, name, ctx) : undefined;
     const sharedStdio = ctx.transport === 'stdio' && !ctx.auth &&
       (op.requiredScopes?.length || ['list_skills', 'get_skill', 'get_skill_asset', 'list_brain_skillpack'].includes(name));
     let registration: Awaited<ReturnType<typeof readLocalWriter>> | undefined;
@@ -1059,18 +1094,19 @@ export async function dispatchToolCall(
         return op.handler(ctx, safeParams);
       })
       : await op.handler(ctx, safeParams);
-    // Hot memory built before a write (forget, remember, …) is never served after it, on every transport.
-    if (op.mutating) invalidateHotMemoryForEngine(engine);
+    // Hot memory built before a write (forget, remember, …) is never served after it, on every transport;
+    // #6696 (A4): the write's receipt carries the capacity notices (60 s snapshot, at most hourly per scope).
+    if (op.mutating) { invalidateHotMemoryForEngine(engine); notices.push(...await writeReceiptCapacityNotices(engine, ctx)); }
     // [E4] verb success metrics: budget drops + entity hit/miss when present.
     {
       const r = result as { dropped_count?: number; found?: boolean; status?: string } | null;
       logVerb(true, {
         ...(typeof r?.dropped_count === 'number' ? { budget_dropped: r.dropped_count } : {}),
         ...(name === 'entity' && typeof r?.found === 'boolean' ? { entity_found: r.found } : {}),
-        // remember's frozen status enum (inserted|duplicate|superseded) —
-        // the memory_writeback doctor counters read this (all-MCP-callers
-        // semantics, labeled honestly there; OV-A11).
+        // remember's frozen status enum (inserted|duplicate|superseded) — the memory_writeback
+        // doctor counters read this (all-MCP-callers semantics, labeled honestly there; OV-A11).
         ...(name === 'remember' && typeof r?.status === 'string' ? { remember_status: r.status } : {}),
+        ...((name === 'entity' || name === 'context_pack') && recordsFiring(result) ? { records_firing: recordsFiring(result)! } : {}),
       });
     }
     // D8: model-visible loudness for empty retrievals. The body stays a bare
@@ -1093,6 +1129,8 @@ export async function dispatchToolCall(
     const rerankDegradedCalls = recordRerankDegradation(responseMeta, opts);
     notices.push(...recallInteropNotices(name, result, responseMeta, safeParams,
       { config: ctx.config, transport: dispatchRenderContext(opts).transport, binding: ctx.explicitReadBinding, rerankDegradedCalls }));
+    const unreadable = await unreadableSourcesNotice(name, safeParams, result, ctx);
+    if (unreadable) notices.push(unreadable);
     notices.push(...await hiddenContentNotices(engine, name, result, ctx, opts));
     // Monthly backup-coverage: one AGGREGATE notice per process (counts only —
     // never a local path or source id). The refresher runs on the stdio
@@ -1131,13 +1169,9 @@ export async function dispatchToolCall(
     // helper crash degrades to no hook keys rather than flipping the whole
     // tool call to error.
     if (opts.metaHook) {
-      try {
-        const meta = await opts.metaHook(name, ctx);
-        if (meta && Object.keys(meta).length > 0) out._meta = { ...(out._meta ?? {}), ...meta };
-      } catch (metaErr) {
-        const msg = metaErr instanceof Error ? metaErr.message : String(metaErr);
-        ctx.logger.warn(`[mcp] _meta hook failed for ${name}: ${msg}; degrading to no hook keys`);
-      }
+      const { meta, failure } = await (earlyMeta ?? runMetaHook(opts.metaHook, name, ctx));
+      if (meta && Object.keys(meta).length > 0) out._meta = { ...(out._meta ?? {}), ...meta };
+      if (failure !== undefined) ctx.logger.warn(`[mcp] _meta hook failed for ${name}: ${failure}; degrading to no hook keys`);
     }
     // Large pages: the egress backstop measures the final frame; a read over the connection's cap is refused whole, never cut.
     const over = op.mutating ? null : await frameOverCap(out, { remote: ctx.remote, transport: ctx.transport, engine, config: ctx.config });

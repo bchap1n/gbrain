@@ -14,11 +14,13 @@ import { type VectorArm, pushVectorList } from '../fusion-lists.ts';
 import { buildRelationalArm } from '../relational-recall.ts';
 import { isAmbiguousModalityQuery } from '../query-intent.ts';
 import { isDbAccessFailure } from '../../pg-access-classify.ts';
+import { isKeywordSkippedAfterTimeout } from '../../postgres-engine/keyword-timeout-cache.ts';
 import { isTimeoutError, pushDegraded } from './degraded.ts';
 import { markKeywordHits } from '../evidence.ts';
 import { resolveEffectiveRecency, resolveEffectiveSalience } from './effective-modes.ts';
 import { searchSalvageEnabled } from '../token-budget.ts';
 import { isDatetimeInputError, warnOncePerProcess } from '../../utils.ts';
+import { withUrgentSearchConnections } from '../connection-budget.ts';
 
 export interface LexicalArms {
   earlyModality: ModalityMode;
@@ -76,8 +78,13 @@ export async function runLexicalArms(req: HybridRequest, earlyModality: Modality
     earlyModality === 'image'
       ? [[], []]
       : await Promise.all([
-          req.timer.overlap('keyword_arm', engine.searchKeyword(query, searchOpts)).catch((err: unknown) => {
+          req.timer.overlap('keyword_arm', engine.searchKeyword(query, opts?.useCache === false ? searchOpts : { ...searchOpts, keywordTimeoutCache: true })).catch((err: unknown) => {
             if (isDatetimeInputError(err)) throw err;
+            if (isKeywordSkippedAfterTimeout(err)) {
+              pushDegraded(degraded, 'keyword_arm_failed', 'skipped_after_timeout');
+              warnOncePerProcess('search-keyword-arm-skipped', `[gbrain] searchKeyword arm skipped (fail-open): ${err.message}`);
+              return [] as SearchResult[];
+            }
             if (isDbAccessFailure(err)) keywordAccessError = err;
             pushDegraded(degraded, 'keyword_arm_failed', isTimeoutError(err) ? 'timeout' : 'provider_error');
             warnOncePerProcess(
@@ -271,18 +278,18 @@ export function startVectorSide(req: HybridRequest, multimodalProviderProbe: str
   const timer = req.timer.branch();
   const degraded: HybridRequest['degraded'] = [];
   const side: HybridRequest = { ...req, timer, degraded, searchOpts: { ...req.searchOpts, onVectorPoolMeta: vectorPoolMetaSink(req, degraded) } };
-  const work = (async () => {
+  const work = withUrgentSearchConnections(async () => {
     const modality = await resolveModalityAndQueries(side);
     return { ...modality, ...await runVectorArms(side, { ...modality, multimodalProviderProbe }) };
-  })();
+  });
   return { work, timer, req: side };
 }
 
 /** Lexical then relational arms on the critical path; a failure waits for the vector side to settle before it is rethrown. */
 export async function runLexicalAndRelational(req: HybridRequest, earlyModality: ModalityMode, vectorSide: VectorSide | null) {
   try {
-    const lexical = await req.timer.stage('lexical', () => runLexicalArms(req, earlyModality));
-    const relationalList = await req.timer.stage('relational', () => buildRelationalList(req));
+    const lexical = await req.timer.stage('lexical', () => withUrgentSearchConnections(() => runLexicalArms(req, earlyModality)));
+    const relationalList = await req.timer.stage('relational', () => withUrgentSearchConnections(() => buildRelationalList(req)));
     return { lexical, relationalList };
   } catch (err) {
     if (vectorSide) await Promise.allSettled([vectorSide.work]);

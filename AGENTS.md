@@ -29,6 +29,8 @@ start here.
    only when the schema is at head; exit 1 with `migrations_pending` means the schema is still behind, and another
    `--yes` repeats the failure, so run `gbrain doctor --json` and fall back to the deterministic install:
    `git clone https://github.com/garrytan/gbrain.git ~/gbrain && cd ~/gbrain && bun install && bun link`.
+   `migrations_pending` with reason `wedged` is different: a migration failed three or more times in a row, so
+   relay its `fix` (ask the user) instead of reinstalling: fix the cause, then `gbrain apply-migrations --force-retry <version>`.
 
 Bun blocks gbrain's postinstall on `bun install -g` (`Blocked 1 postinstall`); a new install can skip it: the script only repeats the refusal every gbrain command prints on a Bun below the floor and runs `gbrain apply-migrations --yes --non-interactive`, which has nothing to migrate before a brain exists, and `gbrain setup` creates the brain and applies its setup migrations.
 
@@ -55,7 +57,15 @@ Bun blocks gbrain's postinstall on `bun install -g` (`Blocked 1 postinstall`); a
 
 ## Memory operating protocol
 
-Recall relevant saved context before answering. Save explicit requests to remember with provenance; confirm corrections against the stored record. Automatic capture requires opt-in. Withdrawal (`forget`) removes a fact from active memory; history, source material, and private backups may remain. Never promise physical erasure. Verify changes with actual GBrain calls and distinguish a local test from a new-conversation test in the harness.
+**Retrieval: gbrain first.** For anything in the brain, run `gbrain search` (names,
+codes, phrases) or `gbrain query` (questions), then `gbrain get <slug>` on a hit.
+Don't grep, cat or SQL the brain checkout first. Filters agents miss:
+`--types '["meeting"]'`, `--match keyword` (every matching page), `--since`/`--until`
+on `query`, `--source <id>`, `--limit`, `--json`; `gbrain backlinks <slug>` and
+`gbrain timeline <slug>` for links and dated events. Copyable examples:
+[brain-first](skills/conventions/brain-first.md#retrieval-gbrain-first).
+
+Recall relevant saved context before answering. Resolve a person (an email sender, an attendee) only by an exact match (`gbrain whois <email or name>`), never a search's top hit ([identity rule](skills/conventions/brain-first.md#identity-exact-match)). Save explicit requests to remember with provenance; confirm corrections against the stored record. Automatic capture requires opt-in. Withdrawal (`forget`) removes a fact from active memory; history, source material, and private backups may remain. Never promise physical erasure. Verify changes with actual GBrain calls and distinguish a local test from a new-conversation test in the harness.
 
 Durable preferences and facts belong in shared memory when the user wants them
 recalled later. Transient task state, credentials, local configuration, and harness
@@ -114,7 +124,10 @@ machine contract. The quick version:
 4. Treat `[gbrain notice …]` blocks and `[AGENT]` blocks the same way. A degraded result is not proof of "no notes".
 <!-- END GENERATED agent-protocol:quick-contract -->
 
-Exit 3 always means "stop and ask the user". Full contract, transcripts, effects,
+Exit 3 always means "stop and ask the user". Exit 10 means the write was
+accepted and is still pending: never "not found" or "failed", so poll the
+receipt (`gbrain write-request <id>`) before retrying, reporting or moving on.
+Full contract, transcripts, effects,
 exit codes and marker grammar: [`docs/protocol/AGENT_OPERATOR_v1.md`](./docs/protocol/AGENT_OPERATOR_v1.md).
 
 ## Read this order
@@ -148,6 +161,25 @@ writing or reviewing an operation, consult `src/core/operations.ts` for the cont
   [`docs/guides/live-sync.md`](./docs/guides/live-sync.md),
   [`docs/mcp/DEPLOY.md`](./docs/mcp/DEPLOY.md),
   [`docs/guides/remote-mcp.md`](./docs/guides/remote-mcp.md) (`gbrain mcp expose`).
+- **Run gbrain from cron, workspace scripts and hooks:** every caller goes
+  through one wrapper that sets `GBRAIN_HOME` (never `HOME`), loads the
+  brain's env file and runs the installed binary, never `bun run src/cli.ts`
+  with an inherited environment. Log stderr (never `2>/dev/null`: a
+  `no_brain` refusal then reads as "no results"), check the exit code, keep
+  hook output off stdout, allow at least 10 s per call, and never print the
+  process environment into a transcript. On a managed brain, schedule
+  `gbrain sources refresh <id>`, and have scripts commit the files they write
+  with `gbrain git commit-push -- <paths>`, never plain `git commit`
+  (`gbrain doctor --only cron_gbrain_home` flags cron lines that skip the
+  wrapper). Wrapper and rules:
+  [cron-schedule.md](docs/guides/cron-schedule.md#calling-gbrain-unattended),
+  [scripts and the managed checkout](docs/guides/shared-checkout-git.md#scripts-and-the-managed-checkout).
+- **Delete or purge pages:** `gbrain delete --purge` skips the 72-hour soft
+  delete, cascades to chunks, versions, links and facts, and `gbrain restore`
+  cannot undo it. Purge only on the user's explicit go for that purge ("scrub
+  the repo" is not one), one page at a time, verifying each; a stopped batch
+  stays stopped until the user says again
+  ([data-loss gate](skills/data-loss-gate/SKILL.md)).
 - **Bring in your chat history:** `gbrain transcripts ingest` imports a
   downloaded ChatGPT / Claude export (or agent session logs); `gbrain connectors`
   connects the account and syncs new conversations live, incrementally and on an
@@ -196,13 +228,16 @@ writing or reviewing an operation, consult `src/core/operations.ts` for the cont
 - **Keep a managed catch-up moving without a human** (a live checkout where
   other agents commit while `gbrain sync` drains thousands of pages): a page
   that moves under the run is held (`concurrent_write`, `worktree_dirty`), a
-  dropped connection is retried, and a relaunch resumes the frozen manifest.
-  The operator loop is `gbrain sync status --source <id> --json` (cursor,
-  `committed_last_10m`, each hold and the last error with `class` /
-  `safe_actions` / `needs_human`), then, when nothing moved and
+  dropped connection is retried, and a relaunch starts a pass that admits only
+  what is still unsettled. The operator loop is
+  `gbrain sync status --source <id> --json` (`state` and `reason`, the
+  newest pass in `convergence`, `committed_last_10m`, each hold and the last error
+  with `class` / `safe_actions` / `needs_human`), then, when nothing moved and
   `needs_human` is false, `gbrain sync unblock --source <id> --apply` and
   the sync it prints; when `needs_human` is true, relay `next.user_message`
-  with the slug. Decision table:
+  with the slug. A plain status skips its heavy reads: a `*_read` field with
+  `status: not_read` means that field was not read (never "none"); run its
+  `fix` (`--detail`) when you need it. Decision table:
   [`docs/guides/sync-unblock-runbook.md`](./docs/guides/sync-unblock-runbook.md).
 - **Writes that ended without committing** (doctor
   `persistence_terminal_failures`, `terminal write failures` in

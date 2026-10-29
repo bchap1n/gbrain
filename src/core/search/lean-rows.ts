@@ -20,6 +20,10 @@
  *     only as `generated` (a machine-written page); modality when not text; stale
  *     only when set (true, or the held-file object from #5988);
  *   - `delivered: { truncated: true }` whenever evidence delivery truncated;
+ *     on a long page `search.long_page_unit` considered, `delivered: { unit,
+ *     reason }` (plus `truncated: true` when cut): `reason` is `long_page`
+ *     when the page came back in that unit, `long_page_chunk` when it kept
+ *     its ranked chunk;
  *   - `evidence_omitted` on a keyword-mode row whose text did not fit.
  * `fields: "full"`, the `mcp.result_rows: full` host config and gbrain's own
  * thin client get every field; trusted local callers always do.
@@ -38,6 +42,8 @@ const KEPT_FIELDS: ReadonlySet<string> = new Set([
   'evidence_omitted',
   // #5575 A6: every row says how much it deserves influence.
   'trust_tier', 'origin', 'unconfirmed',
+  // Result-time collapse and rank priors: folded pages, an unfollowed redirect, an image page's text row.
+  'collapsed', 'redirect_to', 'image_page',
   // Present only when the caller asked for `explain: true`.
   'score_details',
 ]);
@@ -69,7 +75,12 @@ export function leanRow(row: Record<string, unknown>, opts: { keepId?: boolean }
     else if (key === 'stale' && (value === true || (typeof value === 'object' && value !== null))) out[key] = value;
     else if (key === 'modality' && value !== 'text') out[key] = value;
     else if (key === 'provenance' && value === 'generated') out[key] = value;
-    else if (key === 'delivered' && (value as { truncated?: unknown }).truncated === true) out[key] = { truncated: true };
+    else if (key === 'delivered') {
+      const d = value as { unit?: unknown; reason?: unknown; truncated?: unknown };
+      const truncated = d.truncated === true ? { truncated: true } : {};
+      if (d.reason === 'long_page' || d.reason === 'long_page_chunk') out[key] = { unit: d.unit, reason: d.reason, ...truncated };
+      else if (d.truncated === true) out[key] = truncated;
+    }
   }
   return out;
 }

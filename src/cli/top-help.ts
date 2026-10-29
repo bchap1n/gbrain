@@ -26,6 +26,7 @@ SETUP
   migrate --to <postgres|pglite>     Move the brain between engines (PGLite -> Postgres graduates: plan, then --yes --expect)
   migrate embeddings --to <p:model>  Re-embed onto another embedding provider
   embeddings enable --embedding-model <p:model>  Turn on embeddings in place (keeps pages/facts)
+  embeddings prewarm [--dry-run]     Load the vector indexes into shared_buffers when they fit (Postgres)
   upgrade                            Self-update
   check-update [--json]              Check for new versions
   repair [<kind>] [--apply]          Preview/apply residual repairs (timeline, visibility, safe-chunks)
@@ -110,6 +111,7 @@ TOOLS
   lint <dir|file> [--fix]            Catch LLM artifacts, placeholder dates, bad frontmatter
   backfill <kind|list>               v0.30.1: run a registered backfill (effective-date, ...)
   orphans [--json] [--count]         Find pages with no inbound wikilinks
+  beliefs <enable|status|...>        Belief ledger coverage: enable, disable, status, reconcile, backfill
   salience [--days N] [--kind P]     v0.29: pages ranked by emotional + activity salience
   anomalies [--since D] [--sigma N]  v0.29: cohort-based statistical anomalies (tag, type)
   feedback <status|reset>            retrieval feedback: learned page weights; rate answers with gbrain rate
