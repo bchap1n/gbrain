@@ -10,6 +10,102 @@ credits are retained; no result has been reassigned to another provider. Origina
 identifiers and attribution are available in the pre-removal Git revision
 `6040075c6cb95be5881cc2e1b76ef7d71f4e5d29` (retained on 2026-09-23).
 
+## [0.60.498.0] - 2026-10-29
+
+**The Claude Code and Codex plugins now put gbrain's brain-first rule beside every turn, the same way `gbrain setup` does.**
+
+The gbrain plugins (gbrain, gbrain-coding, gbrain-daily) now declare the `UserPromptSubmit` hook `gbrain setup` writes. It runs through the plugin's own launcher with `GBRAIN_HOOK_LANE=plugin`: on Claude Code it's `hook user-prompt` with a 3 s timeout, and on Codex it's `hook user-prompt --harness codex` with 15 s. While a brain-first block is installed, it adds the one-line rule to each turn, plus the read-context block when a serve is running. When setup, `gbrain bootstrap` or a workspace install already wires the event, the plugin's hook exits with no output, so a turn gets it once. Codex skips plugin hooks until you trust them: open `/hooks` and trust it once. A plugin-only install has no block yet. doctor `harness_wiring` and `gbrain post-upgrade` now warn about that and name the one command that adds it.
+
+### How to use it
+
+```bash
+gbrain setup claude-code --instructions-only   # or codex: writes only the brain-first block, which turns the plugin's per-turn rule on
+GBRAIN_HOOKS=0                                 # turns every gbrain hook off, the plugin's included (so does a recorded `gbrain setup <harness> --no-hooks`)
+```
+
+### Itemized changes
+
+- `.claude-plugin/plugin.json`, `.codex-plugin/plugin.json` and the generated persona variants declare the hook. Codex's inline form keeps the hooks.json `hooks` wrapper, since codex-cli ignores a bare event map.
+- `src/core/bootstrap/plugin-lanes.ts` `pluginHookYields`: the plugin hook yields to a gbrain-marked or harness-lane entry in the Claude Code user or project settings, or to a setup or bootstrap group in `CODEX_HOME/hooks.json`, and stays off when that harness's setup receipt records `--no-hooks`. An unreadable file counts as not wired.
+- doctor `harness_wiring` checks the default instruction file of each plugin-served harness. `gbrain post-upgrade` prints the `--instructions-only` command for a missing or stale block (`src/core/setup/brain-first-upgrade-notice.ts`).
+- Tests: `test/plugin-turn-hook.test.ts` (new), `test/doctor-harness-wiring-plugin.test.ts`.
+
+## [0.60.497.0] - 2026-10-29
+
+**`gbrain pages ghosts` and `gbrain repair ghost-pages` no longer flag live code pages as ghosts, so applying the repair can no longer soft-delete a synced `.json` (or any other code or image) page whose file is right there.**
+
+Before, the ghost check looked for a code page's file at `<slug>.md`, because the path resolver it shared with Markdown pages rejected every recorded path that did not end in `.md` or `.mdx`. A synced `projects/example/decisions.active.json` page was looked for at `projects-example-decisions-active-json.md`, found missing, and proposed for soft-delete; the repair's own recheck used the same path, so it agreed. Applying the repair removed live pages, and after the 72-hour purge they were gone for good. Now a page that records a non-Markdown file is checked at that file, both in the scan and in the recheck the repair runs before each soft delete.
+
+### What changed
+
+| Situation | Before | Now |
+|---|---|---|
+| A code or image page whose recorded file exists | listed as a ghost (missing `<slug>.md`); the apply soft-deleted it | not a ghost |
+| A code or image page whose recorded file is gone and no `<slug>.md` exists | listed at `<slug>.md` | listed at its recorded path; the apply soft-deletes it on managed and unmanaged brains |
+| A page whose recorded non-Markdown path names no file inside the source (absolute, `..`) | checked at `<slug>.md` and proposed for soft-delete | never a ghost, never removed; listed apart as `recorded_path_unresolvable` by doctor, `gbrain pages ghosts` and the preview |
+| `gbrain repair uncommitted-deletions` on a soft-deleted code page | read Git evidence for `<slug>.md` | reads it for the recorded file |
+
+### How to get it
+
+Upgrade. If you previewed `gbrain repair ghost-pages` on an older version, preview again before applying: the apply rechecks every page and keeps a code page whose file is present (`file_restored`).
+
+Reported by @Kkkkkuro (#7736).
+
+## [0.60.496.0] - 2026-10-29
+
+**Doctor now finds pages that lost the record of where they came from, and `gbrain repair provenance` puts it back. The repair only ever lowers trust.**
+
+Before v0.60.486.0 (#7892), a remote write could change or drop a page's provenance stamps (`source_kind`, `ingested_via`, `ingested_at`) or its lowering `trust_tier` marker. A page captured from a webhook could then read as your own notes the next time its file was re-read. The new read-only doctor check `provenance_stamp_drift` counts those pages per source from page history and write receipts, split by who made the write, and also counts classified pages whose file would re-read above their stored tier (#7918). `gbrain repair provenance --source <id>` previews each page with its stamps, marker and tier before and after, and writes nothing. After you agree, `--apply --expect <hash> --yes` restores the stamps, stamps the lower marker, lowers the page and files a `lower_page` proposal you can confirm or revert in `gbrain trust review`. Your own edits are never written, and writes with no recorded writer only with `--include-ambiguous`. It runs only when you name it.
+
+Maintenance writes that lower a page now tell you (#7917). A dream or patterns publication over a page you wrote (such as a grounding repair outside the output prefix) still lowers it, and now files a `lower_page` proposal, so it shows up in `gbrain trust review`. A maintenance write whose derivation declaration is present but unreadable now publishes at `unknown`, with an `unknown` marker in the file, instead of taking the write channel's tier (#7918).
+
+### Itemized changes
+
+- `src/core/trust/provenance-drift.ts` (new): the detector (`analyzePageDrift`, `scanProvenanceDrift`, `readPageDrift`), bounded at 50,000 pages per source in doctor.
+- `src/commands/doctor/checks/provenance-stamp-drift.ts` (new): doctor `provenance_stamp_drift`, read-only; its fix previews the repair (`ask_user`).
+- `src/core/repair/provenance.ts` (new): repair kind `provenance`, explicit-only, preview-bound and destructive; `--slug` narrows, `--include-ambiguous` widens.
+- `src/core/trust/page-handlers.ts`: owner page mode `restore_provenance` (local CLI only, bound to the previewed revision and change). On a classic checkout, both repair modes (`restore_provenance` and `repair_marker`, which `gbrain trust backfill --repair-unknown-markers` also uses) write the repaired page to its file in the same transaction; a page whose file holds an edit sync has not imported, or whose checkout cannot be written, is listed `needs_review` and left alone.
+- `src/core/trust/page-write.ts`, `src/core/persistence/prepared-maintenance.ts`, `src/core/trust/taint.ts`, `src/core/cycle/patterns.ts`: maintenance lowerings file `lower_page` on managed and repo-less brains; an unreadable derivation declaration rates the write `unknown`.
+- Two `BEHAVIOR_CHANGES` rows; docs: `docs/guides/repair.md#provenance`, `docs/architecture/key-files/security.md`.
+- Tests: `test/provenance-drift-7891.test.ts` and `test/maintenance-lowering-7917-7918.test.ts` (PGLite and Postgres; classic repository, managed repository and repo-less brains).
+
+## [0.60.495.0] - 2026-10-29
+
+**Every harness install now tells the agent to check gbrain first, and the rule rides each turn, not just the system prompt.**
+
+`gbrain setup <harness>`, `gbrain connect --install`, `gbrain bootstrap harness` and the thin-client GBRAIN-INSTRUCTIONS.md now write a short marked brain-first block into the harness's own instruction file (Claude Code `~/.claude/CLAUDE.md`, Codex `AGENTS.md` or a non-empty `AGENTS.override.md`, opencode `AGENTS.md`, the OpenClaw workspace `AGENTS.md`, an existing Hermes `SOUL.md`, a Cursor project rule). Text outside the markers is never touched, and a re-run upgrades the block in place. While the block is installed, each harness's per-turn hook puts a one-line rule beside every turn: the Claude Code and Codex `UserPromptSubmit` hook, a hook-only OpenClaw plugin (`gbrain-turn-rule`, `before_prompt_build`), and a self-contained Hermes `pre_llm_call` hook. In harness-evals, the block alone was followed in 0 of 80 OpenClaw and 0 of 80 Hermes trials; with the per-turn rule, the installed agent used gbrain in 80 of 80 on each.
+
+New stdio registrations gbrain writes now pin `--surface starter`, the daily-driver tool list (reach and accuracy unchanged, 17-23% fewer input tokens in gbrain-evals#191). Existing registrations keep their surface and are never rewritten, and the Codex and Claude Code plugins and a bare `gbrain serve` stay on `full`.
+
+### How to turn it off
+
+```bash
+gbrain setup <harness> --instructions-only --no-instructions   # removes the block and the per-turn rule, and is remembered
+GBRAIN_AGENT_INSTRUCTIONS=0                                    # same, from the environment
+```
+
+### Itemized changes
+
+- `src/core/setup/brain-first.ts` (new): the block, its per-harness target files, the ledger at `~/.gbrain/agent-instructions.json` and the per-turn rule; `gbrain setup <harness> --instructions-only` manages only the block.
+- `src/core/setup/openclaw-turn-plugin.ts` and `src/core/setup/hermes-turn-hook.ts` (new): the OpenClaw plugin, installed with the openclaw CLI (or printed when openclaw isn't on PATH), and the Hermes hook plus its shell-hooks allowlist approval.
+- `src/commands/hook.ts`: `user-prompt` leads each turn with the rule while a block is installed, with or without a context block.
+- doctor `harness_wiring` warns when a registered harness's block is missing, stale or damaged, with a fix that rewrites only the block, and notes a `--surface full` registration as information only.
+- Tests: `test/setup-brain-first.test.ts`, `test/brain-first-turn-rule.test.ts`, plus updated setup, readiness and registration suites.
+
+## [0.60.494.0] - 2026-10-29
+
+**A conversion to git-canonical now finishes while a live writer commits to the source.**
+
+Door commits (`gbrain git commit-push`) that landed after the apply's second strict pass read its level left Git ahead of the database at those paths, so the closing preview never reached 0 and the apply stopped with `git_conversion_incomplete`, however fast it ran. Nobody can promise a quiet window on a source that scheduled ingest and agents write to. The apply now runs up to three closing strict passes (`strict_pass_closing`) while those commits are all that is left, previewing again after each; the result reports `closing_passes`. No write is held or delayed. If Git is still ahead after the last pass, or anything else is open, the apply stops with `git_conversion_incomplete` and its fix as before, the source stays git-canonical, and a plain `gbrain sync` imports the rest.
+
+**`gbrain sources canonical <id> --to git` on a managed source with no Git checkout now refuses with a typed error and a fix.**
+
+When a managed source's folder was a plain directory, or a `git init` with no commit yet, the preview and the apply failed with `internal_error` and a raw git message. They now refuse with `git_checkout_required` or `git_branch_unborn`, read and write nothing, leave the source usable as it is, and carry a fix that asks the user before the folder becomes a Git repository (then `gbrain sources canonical <id> --to git --dry-run --json` previews again).
+
+- The strict-pass receipt-wait test runs in about 6 seconds instead of sleeping past a 30-second wait: the managed sync receipt waits now live in one module with a test seam. It covers both strict passes.
+- A direct test covers the NULL-vector clause of the no-op embedding check.
+- The admin UI's dev dependency `vite` moves from 6.4.4 to 6.4.5 for GHSA-8g5g-mxqh-grgj (Medium), which the OSV scan reports on every pull request.
+
 ## [0.60.493.0] - 2026-10-29
 
 **`search` now finds a saved fact by its words the way the facts keyword index does, and a newer correction comes back ahead of the fact it corrects (`search.saved_facts_supersede`, on by default). In a keyless replay of 816 harness `search` calls, the author's correction ranked above the retracted post in 27 of 27 reads of the corrections case, against 1 of 27 on 0.60.492.0.**
